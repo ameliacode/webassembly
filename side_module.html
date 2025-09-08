@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+  </head>
+  <body>
+    HTML page I created for my WebAssembly module.
+    <script>
+      const importObject = {
+        env: {
+          __memory_base: 0,
+          __table_base: 0,
+          memory: new WebAssembly.Memory({ initial: 256, maximum: 512 }),
+        },
+      };
+      function isWebAssemblySupported() {
+        try {
+          if (
+            typeof WebAssembly === "object" &&
+            typeof WebAssembly.instantiate === "function"
+          ) {
+            const module = new WebAssembly.Module(
+              Uint8Array.of(0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00)
+            );
+            if (module instanceof WebAssembly.Module) {
+              const moduleInstance = new WebAssembly.Instance(module);
+              return moduleInstance instanceof WebAssembly.Instance;
+            }
+          }
+        } catch (e) {}
+        return false;
+      }
+
+      if (isWebAssemblySupported()) {
+        WebAssembly.instantiateStreaming(
+          fetch("side_module.wasm"),
+          importObject
+        )
+          .then((result) => {
+            const value = result.instance.exports.increment(17);
+            console.log(value.toString());
+          })
+          .catch((err) => {
+            console.error("Failed to instantiate WebAssembly module:", err);
+          });
+      } else {
+        console.log("WebAssembly is not supported in this browser.");
+      }
+    </script>
+  </body>
+</html>
