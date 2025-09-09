@@ -70,6 +70,7 @@ function addToTable(jsFunction, signature) {
   return index;
 }
 
+// if js plumbing, this works as Module.addFunction, Module.removeFunction 
 function convertJsFunctionToWasm(func, sig) {
   var typeSection = [
     0x01,
