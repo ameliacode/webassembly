@@ -21,10 +21,11 @@ EMSCRIPTEN_KEEPALIVE
 
 void free_buffer(const char* pointer) { delete pointer; }
 
-int ValidateValueProvided(const char* value, const char* error_message,
-                          const char* return_error_mesage) {
+extern void UpdateHostAboutError(const char* error_message);
+
+int ValidateValueProvided(const char* value, const char* error_message) {
   if ((value == NULL) || (value[0] == '\0')) {
-    strcpy((char*)return_error_mesage, error_message);
+    UpdateHostAboutError(error_message);
     return 0;
   }
   return 1;
@@ -34,14 +35,13 @@ int ValidateValueProvided(const char* value, const char* error_message,
 EMSCRIPTEN_KEEPALIVE
 #endif
 
-int ValidateName(char* name, int maximum_length, char* return_error_message) {
-  if (ValidateValueProvided(name, "A Product Name must be provided",
-                            return_error_message) == 0) {
+int ValidateName(char* name, int maximum_length) {
+  if (ValidateValueProvided(name, "A Product Name must be provided") == 0) {
     return 0;
   }
 
   if (strlen(name) > maximum_length) {
-    strcpy(return_error_message, "The Product Name is too long");
+    UpdateHostAboutError("The Product Name is too long");
     return 0;
   }
 
@@ -65,18 +65,18 @@ EMSCRIPTEN_KEEPALIVE
 
 int ValidateCategory(char* category_id, int* valid_category_ids,
                      int array_length, char* return_error_message) {
-  if (ValidateValueProvided(category_id, "A Product Category must be selected",
-                            return_error_message) == 0) {
+  if (ValidateValueProvided(category_id,
+                            "A Product Category must be selected") == 0) {
     return 0;
   }
 
   if ((valid_category_ids == NULL) || (array_length == 0)) {
-    strcpy(return_error_message, "There are no Product Categories available");
+    UpdateHostAboutError("There are no Product Categories available");
     return 0;
   }
 
   if (IsCategoryIdInArray(category_id, valid_category_ids, array_length) == 0) {
-    strcpy(return_error_message, "The selected Category is not valid");
+    UpdateHostAboutError("The selected Category is not valid");
     return 0;
   }
 
