@@ -1,3 +1,4 @@
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 
@@ -9,7 +10,16 @@
 extern "C" {
 #endif
 
-#include "side_module_system_functions.h"
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+uint8_t* create_buffer(int size_needed) { return new uint8_t[size_needed]; }
+
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+
+void free_buffer(const char* pointer) { delete pointer; }
 
 int ValidateValueProvided(const char* value, const char* error_message,
                           const char* return_error_mesage) {
@@ -53,14 +63,14 @@ int IsCategoryIdInArray(char* selected_category_id, int* valid_category_ids,
 EMSCRIPTEN_KEEPALIVE
 #endif
 
-int ValidCategory(char* category_id, int* valid_category_ids, int array_length,
-                  char* return_error_message) {
+int ValidateCategory(char* category_id, int* valid_category_ids,
+                     int array_length, char* return_error_message) {
   if (ValidateValueProvided(category_id, "A Product Category must be selected",
                             return_error_message) == 0) {
     return 0;
   }
 
-  if ((valid_category_ids == NULL) || (array_length <= 0)) {
+  if ((valid_category_ids == NULL) || (array_length == 0)) {
     strcpy(return_error_message, "There are no Product Categories available");
     return 0;
   }
