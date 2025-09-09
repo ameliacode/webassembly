@@ -9,6 +9,8 @@
 extern "C" {
 #endif
 
+#include "side_module_system_functions.h"
+
 int ValidateValueProvided(const char* value, const char* error_message,
                           const char* return_error_mesage) {
   if ((value == NULL) || (value[0] == '\0')) {
