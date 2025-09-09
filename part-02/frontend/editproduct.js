@@ -6,8 +6,17 @@ const initialData = {
 const MAXIMUM_NAME_LENGTH = 50;
 const VALID_CATEGORY_IDS = [100, 101];
 
+let validateOnSuccessNameIndex = -1;
+let validateOnSuccessCategoryIndex = -1;
+let validateOnErrorNameIndex = -1;
+let validateOnErrorCategoryIndex = -1;
+
+let validateNameCallbacks = { resolve: null, reject: null };
+let validateCategoryCallbacks = { resolve: null, reject: null };
+
 let moduleExports = null;
 let moduleMemory = null;
+let moduleTable = null;
 
 function initializePage() {
   document.getElementById("name").value = initialData.name;
@@ -20,6 +29,128 @@ function initializePage() {
       break;
     }
   }
+
+  const importObject = {
+    wasi_snapshot_preview1: {
+      proc_exit: (value) => {},
+    },
+  };
+
+  WebAssembly.instantiateStreaming(fetch("validate.wasm"), importObject).then(
+    (result) => {
+      moduleExports = result.instance.exports;
+      moduleMemory = moduleExports.memory;
+      moduleTable = moduleExports.__indirect_function_table;
+
+      validateOnSuccessNameIndex = addToTable(() => {
+        onSuccessCallback(validateNameCallbacks);
+      }, "v");
+
+      validateOnSuccessCategoryIndex = addToTable(() => {
+        onSuccessCallback(validateCategoryCallbacks);
+      }, "v");
+
+      validateOnErrorNameIndex = addToTable((errorMessagePointer) => {
+        onErrorCallback(validateNameCallbacks, errorMessagePointer);
+      }, "vi");
+
+      validateOnErrorCategoryIndex = addToTable((errorMessagePointer) => {
+        onErrorCallback(validateCategoryCallbacks, errorMessagePointer);
+      }, "vi");
+    }
+  );
+}
+
+function addToTable(jsFunction, signature) {
+  const index = moduleTable.length;
+
+  moduleTable.grow(1);
+  moduleTable.set(index, convertJsFunctionToWasm(jsFunction, signature));
+
+  return index;
+}
+
+function convertJsFunctionToWasm(func, sig) {
+  var typeSection = [
+    0x01,
+    0x00,
+    0x01,
+    0x60,
+  ];
+  var sigRet = sig.slice(0, 1);
+  var sigParam = sig.slice(1);
+  var typeCodes = {
+    i: 0x7f,
+    j: 0x7e,
+    f: 0x7d,
+    d: 0x7c,
+  };
+
+  typeSection.push(sigParam.length);
+  for (var i = 0; i < sigParam.length; ++i) {
+    typeSection.push(typeCodes[sigParam[i]]);
+  }
+
+  if (sigRet == "v") {
+    typeSection.push(0x00);
+  } else {
+    typeSection = typeSection.concat([0x01, typeCodes[sigRet]]);
+  }
+
+  typeSection[1] = typeSection.length - 2;
+
+  var bytes = new Uint8Array(
+    [
+      0x00,
+      0x61,
+      0x73,
+      0x6d,
+      0x01,
+      0x00,
+      0x00,
+      0x00,
+    ].concat(typeSection, [
+      0x02,
+      0x07,
+      0x01,
+      0x01,
+      0x65,
+      0x01,
+      0x66,
+      0x00,
+      0x00,
+      0x07,
+      0x05,
+      0x01,
+      0x01,
+      0x66,
+      0x00,
+      0x00,
+    ])
+  );
+
+  var module = new WebAssembly.Module(bytes);
+  var instance = new WebAssembly.Instance(module, {
+    e: {
+      f: func,
+    },
+  });
+  var wrappedFunc = instance.exports.f;
+  return wrappedFunc;
+}
+
+function onSuccessCallback(validateCallbacks) {
+  validateCallbacks.resolve();
+  validateCallbacks.resolve = null;
+  validateCallbacks.reject = null;
+}
+
+function onErrorCallback(validateCallbacks, errorMessagePointer) {
+  const errorMessage = getStringFromMemory(errorMessagePointer);
+
+  validateCallbacks.reject(errorMessage);
+  validateCallbacks.resolve = null;
+  validateCallbacks.reject = null;
 }
 
 function getSelectedCategoryId() {
@@ -74,63 +205,68 @@ function copyStringToMemory(value, memoryOffset) {
   bytes.set(new TextEncoder().encode(value + "\0"), memoryOffset);
 }
 
-function createPointers(resolve, reject, returnPointers) {
-  const onSuccess = Module.addFunction(function () {
-    freePointers(onSuccess, onError);
-    resolve();
-  }, "v");
+function createPointers(isForName, resolve, reject, returnPointers) {
+  if (isForName) {
+    validateNameCallbacks.resolve = resolve;
+    validateNameCallbacks.reject = reject;
 
-  const onError = Module.addFunction(function (errorMessage) {
-    freePointers(onSuccess, onError);
-    reject(Module.UTF8ToString(errorMessage));
-  }, "vi");
+    returnPointers.onSuccess = validateOnSuccessNameIndex;
+    returnPointers.onError = validateOnErrorNameIndex;
+  } else {
+    validateCategoryCallbacks.resolve = resolve;
+    validateCategoryCallbacks.reject = reject;
 
-  returnPointers.onSuccess = onSuccess;
-  returnPointers.onError = onError;
-}
-
-function freePointers(onSuccess, onError) {
-  Module.removeFunction(onSuccess);
-  Module.removeFunction(onError);
+    returnPointers.onSuccess = validateOnSuccessCategoryIndex;
+    returnPointers.onError = validateOnErrorCategoryIndex;
+  }
 }
 
 function validateName(name) {
   return new Promise(function (resolve, reject) {
     const pointers = { onSuccess: null, onError: null };
-    createPointers(resolve, reject, pointers);
+    createPointers(true, resolve, reject, pointers);
 
-    Module.ccall(
-      "ValidateName",
-      null,
-      ["string", "number", "number", "number"],
-      [name, MAXIMUM_NAME_LENGTH, pointers.onSuccess, pointers.onError]
+    const namePointer = moduleExports.create_buffer(name.length + 1);
+    copyStringToMemory(name, namePointer);
+
+    moduleExports.ValidateName(
+      namePointer,
+      MAXIMUM_NAME_LENGTH,
+      pointers.onSuccess,
+      pointers.onError
     );
+    moduleExports.free_buffer(namePointer);
   });
 }
 
 function validateCategory(categoryId) {
   return new Promise(function (resolve, reject) {
     const pointers = { onSuccess: null, onError: null };
-    createPointers(resolve, reject, pointers);
+    createPointers(true, resolve, reject, pointers);
+
+    const categoryIdPointer = moduleExports.create_buffer(
+      categoryId.length + 1
+    );
+    copyStringToMemory(categoryId, categoryIdPointer);
 
     const arrayLength = VALID_CATEGORY_IDS.length;
-    const bytesPerElement = Module.HEAP32.BYTES_PER_ELEMENT;
-    const arrayPointer = Module._malloc(arrayLength * bytesPerElement);
-    Module.HEAP32.set(VALID_CATEGORY_IDS, arrayPointer / bytesPerElement);
-
-    Module.ccall(
-      "ValidateCategory",
-      null,
-      ["string", "number", "number", "number", "number"],
-      [
-        categoryId,
-        arrayPointer,
-        arrayLength,
-        pointers.onSuccess,
-        pointers.onError,
-      ]
+    const bytesPerElement = Int32Array.BYTES_PER_ELEMENT;
+    const arrayPointer = moduleExports.create_buffer(
+      arrayLength * bytesPerElement
     );
 
-    Module._free(arrayPointer);
+    const bytesForArray = new Int32Array(moduleMemory.buffer);
+    bytesForArray.set(VALID_CATEGORY_IDS, arrayPointer / bytesPerElement);
+
+    moduleExports.ValidateCategory(
+      categoryIdPointer,
+      arrayPointer,
+      arrayLength,
+      pointers.onSuccess,
+      pointers.onError
+    );
+
+    moduleExports.free_buffer(arrayPointer);
+    moduleExports.free_buffer(categoryIdPointer);
   });
 }
