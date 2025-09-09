@@ -240,6 +240,13 @@ function assert(condition, text) {
 
 // We used to include malloc/free by default in the past. Show a helpful error in
 // builds with assertions.
+function _malloc() {
+  abort('malloc() called but not included in the build - add `_malloc` to EXPORTED_FUNCTIONS');
+}
+function _free() {
+  // Show a helpful error since we used to include free by default in the past.
+  abort('free() called but not included in the build - add `_free` to EXPORTED_FUNCTIONS');
+}
 
 /**
  * Indicates whether filename is delivered via file protocol (as opposed to http/https)
@@ -672,6 +679,10 @@ async function createWasm() {
     assert(wasmMemory, 'memory not found in wasm exports');
     updateMemoryViews();
 
+    wasmTable = wasmExports['__indirect_function_table'];
+    
+    assert(wasmTable, 'table not found in wasm exports');
+
     assignWasmExports(wasmExports);
     removeRunDependency('wasm-instantiate');
     return wasmExports;
@@ -875,6 +886,19 @@ async function createWasm() {
       }
     };
 
+  var __abort_js = () =>
+      abort('native code called abort()');
+
+  var abortOnCannotGrowMemory = (requestedSize) => {
+      abort(`Cannot enlarge memory arrays to size ${requestedSize} bytes (OOM). Either (1) compile with -sINITIAL_MEMORY=X with X higher than the current value ${HEAP8.length}, (2) compile with -sALLOW_MEMORY_GROWTH which allows increasing the size at runtime, or (3) if you want malloc to return NULL (0) instead of this abort, compile with -sABORTING_MALLOC=0`);
+    };
+  var _emscripten_resize_heap = (requestedSize) => {
+      var oldSize = HEAPU8.length;
+      // With CAN_ADDRESS_2GB or MEMORY64, pointers are already unsigned.
+      requestedSize >>>= 0;
+      abortOnCannotGrowMemory(requestedSize);
+    };
+
   var UTF8Decoder = typeof TextDecoder != 'undefined' ? new TextDecoder() : undefined;
   
   var findStringEnd = (heapOrArray, idx, maxBytesToRead, ignoreNul) => {
@@ -952,23 +976,6 @@ async function createWasm() {
       assert(typeof ptr == 'number', `UTF8ToString expects a number (got ${typeof ptr})`);
       return ptr ? UTF8ArrayToString(HEAPU8, ptr, maxBytesToRead, ignoreNul) : '';
     };
-  function _UpdateHostAboutError(errorMessagePointer) {
-      setErrorMessage(Module.UTF8ToString(errorMessagePointer));
-    }
-
-  var __abort_js = () =>
-      abort('native code called abort()');
-
-  var abortOnCannotGrowMemory = (requestedSize) => {
-      abort(`Cannot enlarge memory arrays to size ${requestedSize} bytes (OOM). Either (1) compile with -sINITIAL_MEMORY=X with X higher than the current value ${HEAP8.length}, (2) compile with -sALLOW_MEMORY_GROWTH which allows increasing the size at runtime, or (3) if you want malloc to return NULL (0) instead of this abort, compile with -sABORTING_MALLOC=0`);
-    };
-  var _emscripten_resize_heap = (requestedSize) => {
-      var oldSize = HEAPU8.length;
-      // With CAN_ADDRESS_2GB or MEMORY64, pointers are already unsigned.
-      requestedSize >>>= 0;
-      abortOnCannotGrowMemory(requestedSize);
-    };
-
   var SYSCALLS = {
   varargs:undefined,
   getStr(ptr) {
@@ -1176,6 +1183,171 @@ async function createWasm() {
       return ret;
     };
 
+
+  var uleb128EncodeWithLen = (arr) => {
+      const n = arr.length;
+      assert(n < 16384);
+      // Note: this LEB128 length encoding produces extra byte for n < 128,
+      // but we don't care as it's only used in a temporary representation.
+      return [(n % 128) | 128, n >> 7, ...arr];
+    };
+  
+  
+  var wasmTypeCodes = {
+      'i': 0x7f, // i32
+      'p': 0x7f, // i32
+      'j': 0x7e, // i64
+      'f': 0x7d, // f32
+      'd': 0x7c, // f64
+      'e': 0x6f, // externref
+    };
+  var generateTypePack = (types) => uleb128EncodeWithLen(Array.from(types, (type) => {
+      var code = wasmTypeCodes[type];
+      assert(code, `invalid signature char: ${type}`);
+      return code;
+    }));
+  var convertJsFunctionToWasm = (func, sig) => {
+  
+      // Rest of the module is static
+      var bytes = Uint8Array.of(
+        0x00, 0x61, 0x73, 0x6d, // magic ("\0asm")
+        0x01, 0x00, 0x00, 0x00, // version: 1
+        0x01, // Type section code
+          // The module is static, with the exception of the type section, which is
+          // generated based on the signature passed in.
+          ...uleb128EncodeWithLen([
+            0x01, // count: 1
+            0x60 /* form: func */,
+            // param types
+            ...generateTypePack(sig.slice(1)),
+            // return types (for now only supporting [] if `void` and single [T] otherwise)
+            ...generateTypePack(sig[0] === 'v' ? '' : sig[0])
+          ]),
+        // The rest of the module is static
+        0x02, 0x07, // import section
+          // (import "e" "f" (func 0 (type 0)))
+          0x01, 0x01, 0x65, 0x01, 0x66, 0x00, 0x00,
+        0x07, 0x05, // export section
+          // (export "f" (func 0 (type 0)))
+          0x01, 0x01, 0x66, 0x00, 0x00,
+      );
+  
+      // We can compile this wasm module synchronously because it is very small.
+      // This accepts an import (at "e.f"), that it reroutes to an export (at "f")
+      var module = new WebAssembly.Module(bytes);
+      var instance = new WebAssembly.Instance(module, { 'e': { 'f': func } });
+      var wrappedFunc = instance.exports['f'];
+      return wrappedFunc;
+    };
+  
+  var wasmTableMirror = [];
+  
+  /** @type {WebAssembly.Table} */
+  var wasmTable;
+  var getWasmTableEntry = (funcPtr) => {
+      var func = wasmTableMirror[funcPtr];
+      if (!func) {
+        /** @suppress {checkTypes} */
+        wasmTableMirror[funcPtr] = func = wasmTable.get(funcPtr);
+      }
+      /** @suppress {checkTypes} */
+      assert(wasmTable.get(funcPtr) == func, 'JavaScript-side Wasm function table mirror is out of date!');
+      return func;
+    };
+  
+  var updateTableMap = (offset, count) => {
+      if (functionsInTableMap) {
+        for (var i = offset; i < offset + count; i++) {
+          var item = getWasmTableEntry(i);
+          // Ignore null values.
+          if (item) {
+            functionsInTableMap.set(item, i);
+          }
+        }
+      }
+    };
+  
+  var functionsInTableMap;
+  
+  var getFunctionAddress = (func) => {
+      // First, create the map if this is the first use.
+      if (!functionsInTableMap) {
+        functionsInTableMap = new WeakMap();
+        updateTableMap(0, wasmTable.length);
+      }
+      return functionsInTableMap.get(func) || 0;
+    };
+  
+  
+  var freeTableIndexes = [];
+  
+  var getEmptyTableSlot = () => {
+      // Reuse a free index if there is one, otherwise grow.
+      if (freeTableIndexes.length) {
+        return freeTableIndexes.pop();
+      }
+      try {
+        // Grow the table
+        return wasmTable['grow'](1);
+      } catch (err) {
+        if (!(err instanceof RangeError)) {
+          throw err;
+        }
+        throw 'Unable to grow wasm table. Set ALLOW_TABLE_GROWTH.';
+      }
+    };
+  
+  
+  var setWasmTableEntry = (idx, func) => {
+      /** @suppress {checkTypes} */
+      wasmTable.set(idx, func);
+      // With ABORT_ON_WASM_EXCEPTIONS wasmTable.get is overridden to return wrapped
+      // functions so we need to call it here to retrieve the potential wrapper correctly
+      // instead of just storing 'func' directly into wasmTableMirror
+      /** @suppress {checkTypes} */
+      wasmTableMirror[idx] = wasmTable.get(idx);
+    };
+  /** @param {string=} sig */
+  var addFunction = (func, sig) => {
+      assert(typeof func != 'undefined');
+      // Check if the function is already in the table, to ensure each function
+      // gets a unique index.
+      var rtn = getFunctionAddress(func);
+      if (rtn) {
+        return rtn;
+      }
+  
+      // It's not in the table, add it now.
+  
+      var ret = getEmptyTableSlot();
+  
+      // Set the new value.
+      try {
+        // Attempting to call this with JS function will cause of table.set() to fail
+        setWasmTableEntry(ret, func);
+      } catch (err) {
+        if (!(err instanceof TypeError)) {
+          throw err;
+        }
+        assert(typeof sig != 'undefined', 'Missing signature argument to addFunction: ' + func);
+        var wrapped = convertJsFunctionToWasm(func, sig);
+        setWasmTableEntry(ret, wrapped);
+      }
+  
+      functionsInTableMap.set(func, ret);
+  
+      return ret;
+    };
+
+  
+  
+  
+  
+  var removeFunction = (index) => {
+      functionsInTableMap.delete(getWasmTableEntry(index));
+      setWasmTableEntry(index, null);
+      freeTableIndexes.push(index);
+    };
 // End JS library code
 
 // include: postlibrary.js
@@ -1227,54 +1399,411 @@ Module['FS_createPreloadedFile'] = FS.createPreloadedFile;
 
 // Begin runtime exports
   Module['ccall'] = ccall;
+  Module['addFunction'] = addFunction;
+  Module['removeFunction'] = removeFunction;
   Module['UTF8ToString'] = UTF8ToString;
+  var missingLibrarySymbols = [
+  'writeI53ToI64',
+  'writeI53ToI64Clamped',
+  'writeI53ToI64Signaling',
+  'writeI53ToU64Clamped',
+  'writeI53ToU64Signaling',
+  'readI53FromI64',
+  'readI53FromU64',
+  'convertI32PairToI53',
+  'convertI32PairToI53Checked',
+  'convertU32PairToI53',
+  'getTempRet0',
+  'setTempRet0',
+  'zeroMemory',
+  'exitJS',
+  'getHeapMax',
+  'growMemory',
+  'withStackSave',
+  'strError',
+  'inetPton4',
+  'inetNtop4',
+  'inetPton6',
+  'inetNtop6',
+  'readSockaddr',
+  'writeSockaddr',
+  'readEmAsmArgs',
+  'jstoi_q',
+  'getExecutableName',
+  'autoResumeAudioContext',
+  'getDynCaller',
+  'dynCall',
+  'handleException',
+  'keepRuntimeAlive',
+  'runtimeKeepalivePush',
+  'runtimeKeepalivePop',
+  'callUserCallback',
+  'maybeExit',
+  'asyncLoad',
+  'asmjsMangle',
+  'alignMemory',
+  'mmapAlloc',
+  'HandleAllocator',
+  'getNativeTypeSize',
+  'getUniqueRunDependency',
+  'addOnInit',
+  'addOnPostCtor',
+  'addOnPreMain',
+  'addOnExit',
+  'STACK_SIZE',
+  'STACK_ALIGN',
+  'POINTER_SIZE',
+  'ASSERTIONS',
+  'cwrap',
+  'intArrayFromString',
+  'intArrayToString',
+  'AsciiToString',
+  'stringToAscii',
+  'UTF16ToString',
+  'stringToUTF16',
+  'lengthBytesUTF16',
+  'UTF32ToString',
+  'stringToUTF32',
+  'lengthBytesUTF32',
+  'stringToNewUTF8',
+  'registerKeyEventCallback',
+  'maybeCStringToJsString',
+  'findEventTarget',
+  'getBoundingClientRect',
+  'fillMouseEventData',
+  'registerMouseEventCallback',
+  'registerWheelEventCallback',
+  'registerUiEventCallback',
+  'registerFocusEventCallback',
+  'fillDeviceOrientationEventData',
+  'registerDeviceOrientationEventCallback',
+  'fillDeviceMotionEventData',
+  'registerDeviceMotionEventCallback',
+  'screenOrientation',
+  'fillOrientationChangeEventData',
+  'registerOrientationChangeEventCallback',
+  'fillFullscreenChangeEventData',
+  'registerFullscreenChangeEventCallback',
+  'JSEvents_requestFullscreen',
+  'JSEvents_resizeCanvasForFullscreen',
+  'registerRestoreOldStyle',
+  'hideEverythingExceptGivenElement',
+  'restoreHiddenElements',
+  'setLetterbox',
+  'softFullscreenResizeWebGLRenderTarget',
+  'doRequestFullscreen',
+  'fillPointerlockChangeEventData',
+  'registerPointerlockChangeEventCallback',
+  'registerPointerlockErrorEventCallback',
+  'requestPointerLock',
+  'fillVisibilityChangeEventData',
+  'registerVisibilityChangeEventCallback',
+  'registerTouchEventCallback',
+  'fillGamepadEventData',
+  'registerGamepadEventCallback',
+  'registerBeforeUnloadEventCallback',
+  'fillBatteryEventData',
+  'registerBatteryEventCallback',
+  'setCanvasElementSize',
+  'getCanvasElementSize',
+  'jsStackTrace',
+  'getCallstack',
+  'convertPCtoSourceLocation',
+  'getEnvStrings',
+  'checkWasiClock',
+  'wasiRightsToMuslOFlags',
+  'wasiOFlagsToMuslOFlags',
+  'initRandomFill',
+  'randomFill',
+  'safeSetTimeout',
+  'setImmediateWrapped',
+  'safeRequestAnimationFrame',
+  'clearImmediateWrapped',
+  'registerPostMainLoop',
+  'registerPreMainLoop',
+  'getPromise',
+  'makePromise',
+  'idsToPromises',
+  'makePromiseCallback',
+  'ExceptionInfo',
+  'findMatchingCatch',
+  'Browser_asyncPrepareDataCounter',
+  'isLeapYear',
+  'ydayFromDate',
+  'arraySum',
+  'addDays',
+  'getSocketFromFD',
+  'getSocketAddress',
+  'FS_createPreloadedFile',
+  'FS_preloadFile',
+  'FS_modeStringToFlags',
+  'FS_getMode',
+  'FS_stdin_getChar',
+  'FS_mkdirTree',
+  '_setNetworkCallback',
+  'heapObjectForWebGLType',
+  'toTypedArrayIndex',
+  'webgl_enable_ANGLE_instanced_arrays',
+  'webgl_enable_OES_vertex_array_object',
+  'webgl_enable_WEBGL_draw_buffers',
+  'webgl_enable_WEBGL_multi_draw',
+  'webgl_enable_EXT_polygon_offset_clamp',
+  'webgl_enable_EXT_clip_control',
+  'webgl_enable_WEBGL_polygon_mode',
+  'emscriptenWebGLGet',
+  'computeUnpackAlignedImageSize',
+  'colorChannelsInGlTextureFormat',
+  'emscriptenWebGLGetTexPixelData',
+  'emscriptenWebGLGetUniform',
+  'webglGetUniformLocation',
+  'webglPrepareUniformLocationsBeforeFirstUse',
+  'webglGetLeftBracePos',
+  'emscriptenWebGLGetVertexAttrib',
+  '__glGetActiveAttribOrUniform',
+  'writeGLArray',
+  'registerWebGlEventCallback',
+  'runAndAbortIfError',
+  'ALLOC_NORMAL',
+  'ALLOC_STACK',
+  'allocate',
+  'writeStringToMemory',
+  'writeAsciiToMemory',
+  'demangle',
+  'stackTrace',
+];
+missingLibrarySymbols.forEach(missingLibrarySymbol)
+
+  var unexportedSymbols = [
+  'run',
+  'out',
+  'err',
+  'callMain',
+  'abort',
+  'wasmMemory',
+  'wasmExports',
+  'HEAPF32',
+  'HEAPF64',
+  'HEAP8',
+  'HEAPU8',
+  'HEAP16',
+  'HEAPU16',
+  'HEAPU32',
+  'HEAP64',
+  'HEAPU64',
+  'writeStackCookie',
+  'checkStackCookie',
+  'INT53_MAX',
+  'INT53_MIN',
+  'bigintToI53Checked',
+  'stackSave',
+  'stackRestore',
+  'stackAlloc',
+  'ptrToString',
+  'abortOnCannotGrowMemory',
+  'ENV',
+  'ERRNO_CODES',
+  'DNS',
+  'Protocols',
+  'Sockets',
+  'timers',
+  'warnOnce',
+  'readEmAsmArgsArray',
+  'wasmTable',
+  'noExitRuntime',
+  'addRunDependency',
+  'removeRunDependency',
+  'addOnPreRun',
+  'addOnPostRun',
+  'convertJsFunctionToWasm',
+  'freeTableIndexes',
+  'functionsInTableMap',
+  'getEmptyTableSlot',
+  'updateTableMap',
+  'getFunctionAddress',
+  'setValue',
+  'getValue',
+  'PATH',
+  'PATH_FS',
+  'UTF8Decoder',
+  'UTF8ArrayToString',
+  'stringToUTF8Array',
+  'stringToUTF8',
+  'lengthBytesUTF8',
+  'UTF16Decoder',
+  'stringToUTF8OnStack',
+  'writeArrayToMemory',
+  'JSEvents',
+  'specialHTMLTargets',
+  'findCanvasEventTarget',
+  'currentFullscreenStrategy',
+  'restoreOldWindowedStyle',
+  'UNWIND_CACHE',
+  'ExitStatus',
+  'flush_NO_FILESYSTEM',
+  'emSetImmediate',
+  'emClearImmediate_deps',
+  'emClearImmediate',
+  'promiseMap',
+  'uncaughtExceptionCount',
+  'exceptionLast',
+  'exceptionCaught',
+  'Browser',
+  'requestFullscreen',
+  'requestFullScreen',
+  'setCanvasSize',
+  'getUserMedia',
+  'createContext',
+  'getPreloadedImageData__data',
+  'wget',
+  'MONTH_DAYS_REGULAR',
+  'MONTH_DAYS_LEAP',
+  'MONTH_DAYS_REGULAR_CUMULATIVE',
+  'MONTH_DAYS_LEAP_CUMULATIVE',
+  'SYSCALLS',
+  'preloadPlugins',
+  'FS_stdin_getChar_buffer',
+  'FS_unlink',
+  'FS_createPath',
+  'FS_createDevice',
+  'FS_readFile',
+  'FS',
+  'FS_root',
+  'FS_mounts',
+  'FS_devices',
+  'FS_streams',
+  'FS_nextInode',
+  'FS_nameTable',
+  'FS_currentPath',
+  'FS_initialized',
+  'FS_ignorePermissions',
+  'FS_filesystems',
+  'FS_syncFSRequests',
+  'FS_readFiles',
+  'FS_lookupPath',
+  'FS_getPath',
+  'FS_hashName',
+  'FS_hashAddNode',
+  'FS_hashRemoveNode',
+  'FS_lookupNode',
+  'FS_createNode',
+  'FS_destroyNode',
+  'FS_isRoot',
+  'FS_isMountpoint',
+  'FS_isFile',
+  'FS_isDir',
+  'FS_isLink',
+  'FS_isChrdev',
+  'FS_isBlkdev',
+  'FS_isFIFO',
+  'FS_isSocket',
+  'FS_flagsToPermissionString',
+  'FS_nodePermissions',
+  'FS_mayLookup',
+  'FS_mayCreate',
+  'FS_mayDelete',
+  'FS_mayOpen',
+  'FS_checkOpExists',
+  'FS_nextfd',
+  'FS_getStreamChecked',
+  'FS_getStream',
+  'FS_createStream',
+  'FS_closeStream',
+  'FS_dupStream',
+  'FS_doSetAttr',
+  'FS_chrdev_stream_ops',
+  'FS_major',
+  'FS_minor',
+  'FS_makedev',
+  'FS_registerDevice',
+  'FS_getDevice',
+  'FS_getMounts',
+  'FS_syncfs',
+  'FS_mount',
+  'FS_unmount',
+  'FS_lookup',
+  'FS_mknod',
+  'FS_statfs',
+  'FS_statfsStream',
+  'FS_statfsNode',
+  'FS_create',
+  'FS_mkdir',
+  'FS_mkdev',
+  'FS_symlink',
+  'FS_rename',
+  'FS_rmdir',
+  'FS_readdir',
+  'FS_readlink',
+  'FS_stat',
+  'FS_fstat',
+  'FS_lstat',
+  'FS_doChmod',
+  'FS_chmod',
+  'FS_lchmod',
+  'FS_fchmod',
+  'FS_doChown',
+  'FS_chown',
+  'FS_lchown',
+  'FS_fchown',
+  'FS_doTruncate',
+  'FS_truncate',
+  'FS_ftruncate',
+  'FS_utime',
+  'FS_open',
+  'FS_close',
+  'FS_isClosed',
+  'FS_llseek',
+  'FS_read',
+  'FS_write',
+  'FS_mmap',
+  'FS_msync',
+  'FS_ioctl',
+  'FS_writeFile',
+  'FS_cwd',
+  'FS_chdir',
+  'FS_createDefaultDirectories',
+  'FS_createDefaultDevices',
+  'FS_createSpecialDirectories',
+  'FS_createStandardStreams',
+  'FS_staticInit',
+  'FS_init',
+  'FS_quit',
+  'FS_findObject',
+  'FS_analyzePath',
+  'FS_createFile',
+  'FS_createDataFile',
+  'FS_forceLoadFile',
+  'FS_createLazyFile',
+  'FS_absolutePath',
+  'FS_createFolder',
+  'FS_createLink',
+  'FS_joinPath',
+  'FS_mmapAlloc',
+  'FS_standardizePath',
+  'MEMFS',
+  'TTY',
+  'PIPEFS',
+  'SOCKFS',
+  'tempFixedLengthArray',
+  'miniTempWebGLFloatBuffers',
+  'miniTempWebGLIntBuffers',
+  'GL',
+  'AL',
+  'GLUT',
+  'EGL',
+  'GLEW',
+  'IDBStore',
+  'SDL',
+  'SDL_gfx',
+  'allocateUTF8',
+  'allocateUTF8OnStack',
+  'print',
+  'printErr',
+  'jstoi_s',
+];
+unexportedSymbols.forEach(unexportedRuntimeSymbol);
+
   // End runtime exports
   // Begin JS library exports
-  Module['ExitStatus'] = ExitStatus;
-  Module['addOnPostRun'] = addOnPostRun;
-  Module['onPostRuns'] = onPostRuns;
-  Module['callRuntimeCallbacks'] = callRuntimeCallbacks;
-  Module['addOnPreRun'] = addOnPreRun;
-  Module['onPreRuns'] = onPreRuns;
-  Module['addRunDependency'] = addRunDependency;
-  Module['runDependencies'] = runDependencies;
-  Module['removeRunDependency'] = removeRunDependency;
-  Module['dependenciesFulfilled'] = dependenciesFulfilled;
-  Module['runDependencyTracking'] = runDependencyTracking;
-  Module['runDependencyWatcher'] = runDependencyWatcher;
-  Module['getValue'] = getValue;
-  Module['noExitRuntime'] = noExitRuntime;
-  Module['ptrToString'] = ptrToString;
-  Module['setValue'] = setValue;
-  Module['stackRestore'] = stackRestore;
-  Module['stackSave'] = stackSave;
-  Module['warnOnce'] = warnOnce;
-  Module['_UpdateHostAboutError'] = _UpdateHostAboutError;
-  Module['UTF8ToString'] = UTF8ToString;
-  Module['UTF8ArrayToString'] = UTF8ArrayToString;
-  Module['UTF8Decoder'] = UTF8Decoder;
-  Module['findStringEnd'] = findStringEnd;
-  Module['__abort_js'] = __abort_js;
-  Module['_emscripten_resize_heap'] = _emscripten_resize_heap;
-  Module['abortOnCannotGrowMemory'] = abortOnCannotGrowMemory;
-  Module['_fd_close'] = _fd_close;
-  Module['SYSCALLS'] = SYSCALLS;
-  Module['_fd_seek'] = _fd_seek;
-  Module['bigintToI53Checked'] = bigintToI53Checked;
-  Module['INT53_MAX'] = INT53_MAX;
-  Module['INT53_MIN'] = INT53_MIN;
-  Module['_fd_write'] = _fd_write;
-  Module['flush_NO_FILESYSTEM'] = flush_NO_FILESYSTEM;
-  Module['printChar'] = printChar;
-  Module['printCharBuffers'] = printCharBuffers;
-  Module['ccall'] = ccall;
-  Module['getCFunc'] = getCFunc;
-  Module['writeArrayToMemory'] = writeArrayToMemory;
-  Module['stringToUTF8OnStack'] = stringToUTF8OnStack;
-  Module['lengthBytesUTF8'] = lengthBytesUTF8;
-  Module['stringToUTF8'] = stringToUTF8;
-  Module['stringToUTF8Array'] = stringToUTF8Array;
-  Module['stackAlloc'] = stackAlloc;
   // End JS library exports
 
 // end include: postlibrary.js
@@ -1288,38 +1817,32 @@ var _create_buffer = Module['_create_buffer'] = makeInvalidEarlyAccess('_create_
 var _free_buffer = Module['_free_buffer'] = makeInvalidEarlyAccess('_free_buffer');
 var _ValidateName = Module['_ValidateName'] = makeInvalidEarlyAccess('_ValidateName');
 var _ValidateCategory = Module['_ValidateCategory'] = makeInvalidEarlyAccess('_ValidateCategory');
-var _fflush = Module['_fflush'] = makeInvalidEarlyAccess('_fflush');
-var _strerror = Module['_strerror'] = makeInvalidEarlyAccess('_strerror');
-var _malloc = Module['_malloc'] = makeInvalidEarlyAccess('_malloc');
-var _free = Module['_free'] = makeInvalidEarlyAccess('_free');
-var _emscripten_stack_init = Module['_emscripten_stack_init'] = makeInvalidEarlyAccess('_emscripten_stack_init');
-var _emscripten_stack_get_free = Module['_emscripten_stack_get_free'] = makeInvalidEarlyAccess('_emscripten_stack_get_free');
-var _emscripten_stack_get_base = Module['_emscripten_stack_get_base'] = makeInvalidEarlyAccess('_emscripten_stack_get_base');
-var _emscripten_stack_get_end = Module['_emscripten_stack_get_end'] = makeInvalidEarlyAccess('_emscripten_stack_get_end');
-var __emscripten_stack_restore = Module['__emscripten_stack_restore'] = makeInvalidEarlyAccess('__emscripten_stack_restore');
-var __emscripten_stack_alloc = Module['__emscripten_stack_alloc'] = makeInvalidEarlyAccess('__emscripten_stack_alloc');
-var _emscripten_stack_get_current = Module['_emscripten_stack_get_current'] = makeInvalidEarlyAccess('_emscripten_stack_get_current');
+var _fflush = makeInvalidEarlyAccess('_fflush');
+var _strerror = makeInvalidEarlyAccess('_strerror');
+var _emscripten_stack_init = makeInvalidEarlyAccess('_emscripten_stack_init');
+var _emscripten_stack_get_free = makeInvalidEarlyAccess('_emscripten_stack_get_free');
+var _emscripten_stack_get_base = makeInvalidEarlyAccess('_emscripten_stack_get_base');
+var _emscripten_stack_get_end = makeInvalidEarlyAccess('_emscripten_stack_get_end');
+var __emscripten_stack_restore = makeInvalidEarlyAccess('__emscripten_stack_restore');
+var __emscripten_stack_alloc = makeInvalidEarlyAccess('__emscripten_stack_alloc');
+var _emscripten_stack_get_current = makeInvalidEarlyAccess('_emscripten_stack_get_current');
 
 function assignWasmExports(wasmExports) {
   Module['_create_buffer'] = _create_buffer = createExportWrapper('create_buffer', 1);
   Module['_free_buffer'] = _free_buffer = createExportWrapper('free_buffer', 1);
-  Module['_ValidateName'] = _ValidateName = createExportWrapper('ValidateName', 2);
-  Module['_ValidateCategory'] = _ValidateCategory = createExportWrapper('ValidateCategory', 4);
-  Module['_fflush'] = _fflush = createExportWrapper('fflush', 1);
-  Module['_strerror'] = _strerror = createExportWrapper('strerror', 1);
-  Module['_malloc'] = _malloc = createExportWrapper('malloc', 1);
-  Module['_free'] = _free = createExportWrapper('free', 1);
-  Module['_emscripten_stack_init'] = _emscripten_stack_init = wasmExports['emscripten_stack_init'];
-  Module['_emscripten_stack_get_free'] = _emscripten_stack_get_free = wasmExports['emscripten_stack_get_free'];
-  Module['_emscripten_stack_get_base'] = _emscripten_stack_get_base = wasmExports['emscripten_stack_get_base'];
-  Module['_emscripten_stack_get_end'] = _emscripten_stack_get_end = wasmExports['emscripten_stack_get_end'];
-  Module['__emscripten_stack_restore'] = __emscripten_stack_restore = wasmExports['_emscripten_stack_restore'];
-  Module['__emscripten_stack_alloc'] = __emscripten_stack_alloc = wasmExports['_emscripten_stack_alloc'];
-  Module['_emscripten_stack_get_current'] = _emscripten_stack_get_current = wasmExports['emscripten_stack_get_current'];
+  Module['_ValidateName'] = _ValidateName = createExportWrapper('ValidateName', 4);
+  Module['_ValidateCategory'] = _ValidateCategory = createExportWrapper('ValidateCategory', 5);
+  _fflush = createExportWrapper('fflush', 1);
+  _strerror = createExportWrapper('strerror', 1);
+  _emscripten_stack_init = wasmExports['emscripten_stack_init'];
+  _emscripten_stack_get_free = wasmExports['emscripten_stack_get_free'];
+  _emscripten_stack_get_base = wasmExports['emscripten_stack_get_base'];
+  _emscripten_stack_get_end = wasmExports['emscripten_stack_get_end'];
+  __emscripten_stack_restore = wasmExports['_emscripten_stack_restore'];
+  __emscripten_stack_alloc = wasmExports['_emscripten_stack_alloc'];
+  _emscripten_stack_get_current = wasmExports['emscripten_stack_get_current'];
 }
 var wasmImports = {
-  /** @export */
-  UpdateHostAboutError: _UpdateHostAboutError,
   /** @export */
   _abort_js: __abort_js,
   /** @export */

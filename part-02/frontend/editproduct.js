@@ -6,6 +6,8 @@ const initialData = {
 const MAXIMUM_NAME_LENGTH = 50;
 const VALID_CATEGORY_IDS = [100, 101];
 
+let moduleExports = null;
+let moduleMemory = null;
 
 function initializePage() {
   document.getElementById("name").value = initialData.name;
@@ -41,32 +43,94 @@ function onClickSave() {
   const name = document.getElementById("name").value;
   const categoryId = getSelectedCategoryId();
 
-  if (validateName(name) && validateCategory(categoryId)) {}
+  Promise.all([validateName(name), validateCategory(categoryId)])
+    .then(() => {})
+    .catch((error) => {
+      setErrorMessage(error);
+    });
+}
+
+function getStringFromMemory(memoryOffset) {
+  let returnValue = "";
+
+  const size = 256;
+  const bytes = new Uint8Array(moduleMemory.buffer, memoryOffset, size);
+
+  let character = "";
+  for (let i = 0; i < size; i++) {
+    character = String.fromCharCode(bytes[i]);
+    if (character === "\0") {
+      break;
+    }
+
+    returnValue += character;
+  }
+
+  return returnValue;
+}
+
+function copyStringToMemory(value, memoryOffset) {
+  const bytes = new Uint8Array(moduleMemory.buffer);
+  bytes.set(new TextEncoder().encode(value + "\0"), memoryOffset);
+}
+
+function createPointers(resolve, reject, returnPointers) {
+  const onSuccess = Module.addFunction(function () {
+    freePointers(onSuccess, onError);
+    resolve();
+  }, "v");
+
+  const onError = Module.addFunction(function (errorMessage) {
+    freePointers(onSuccess, onError);
+    reject(Module.UTF8ToString(errorMessage));
+  }, "vi");
+
+  returnPointers.onSuccess = onSuccess;
+  returnPointers.onError = onError;
+}
+
+function freePointers(onSuccess, onError) {
+  Module.removeFunction(onSuccess);
+  Module.removeFunction(onError);
 }
 
 function validateName(name) {
-  const isValid = Module.ccall(
-    "ValidateName",
-    "number",
-    ["string", "number"],
-    [name, MAXIMUM_NAME_LENGTH]
-  );
+  return new Promise(function (resolve, reject) {
+    const pointers = { onSuccess: null, onError: null };
+    createPointers(resolve, reject, pointers);
 
-  return isValid === 1;
+    Module.ccall(
+      "ValidateName",
+      null,
+      ["string", "number", "number", "number"],
+      [name, MAXIMUM_NAME_LENGTH, pointers.onSuccess, pointers.onError]
+    );
+  });
 }
 
 function validateCategory(categoryId) {
-  const arrayLength = VALID_CATEGORY_IDS.length;
-  const bytesPerElement = Module.HEAP32.BYTES_PER_ELEMENT;
-  const arrayPointer = Module._malloc((arrayLength * bytesPerElement));
-  Module.HEAP32.set(VALID_CATEGORY_IDS, (arrayPointer / bytesPerElement));
+  return new Promise(function (resolve, reject) {
+    const pointers = { onSuccess: null, onError: null };
+    createPointers(resolve, reject, pointers);
 
-  const isValid = Module.ccall('ValidateCategory', 
-      'number',
-      ['string', 'number', 'number'],
-      [categoryId, arrayPointer, arrayLength]);
+    const arrayLength = VALID_CATEGORY_IDS.length;
+    const bytesPerElement = Module.HEAP32.BYTES_PER_ELEMENT;
+    const arrayPointer = Module._malloc(arrayLength * bytesPerElement);
+    Module.HEAP32.set(VALID_CATEGORY_IDS, arrayPointer / bytesPerElement);
 
-  Module._free(arrayPointer);
+    Module.ccall(
+      "ValidateCategory",
+      null,
+      ["string", "number", "number", "number", "number"],
+      [
+        categoryId,
+        arrayPointer,
+        arrayLength,
+        pointers.onSuccess,
+        pointers.onError,
+      ]
+    );
 
-  return (isValid === 1);
+    Module._free(arrayPointer);
+  });
 }

@@ -21,11 +21,11 @@ EMSCRIPTEN_KEEPALIVE
 
 void free_buffer(const char* pointer) { delete pointer; }
 
-extern void UpdateHostAboutError(const char* error_message);
+typedef void (*OnSuccess)(void);
+typedef void (*OnError)(const char*);
 
-int ValidateValueProvided(const char* value, const char* error_message) {
+int ValidateValueProvided(const char* value) {
   if ((value == NULL) || (value[0] == '\0')) {
-    UpdateHostAboutError(error_message);
     return 0;
   }
   return 1;
@@ -35,13 +35,14 @@ int ValidateValueProvided(const char* value, const char* error_message) {
 EMSCRIPTEN_KEEPALIVE
 #endif
 
-int ValidateName(char* name, int maximum_length) {
-  if (ValidateValueProvided(name, "A Product Name must be provided") == 0) {
-    return 0;
+int ValidateName(char* name, int maximum_length, OnSuccess UpdateHostOnSuccess,
+                 OnError UpdateHostOnError) {
+  if (ValidateValueProvided(name) == 0) {
+    UpdateHostOnError("A Product Name must be provided");
   }
 
   if (strlen(name) > maximum_length) {
-    UpdateHostAboutError("The Product Name is too long");
+    UpdateHostOnError("The Product Name is too long");
     return 0;
   }
 
@@ -64,20 +65,19 @@ EMSCRIPTEN_KEEPALIVE
 #endif
 
 int ValidateCategory(char* category_id, int* valid_category_ids,
-                     int array_length, char* return_error_message) {
-  if (ValidateValueProvided(category_id,
-                            "A Product Category must be selected") == 0) {
+                     int array_length, OnSuccess UpdateHostOnSuccess,
+                     OnError UpdateHostOnError) {
+  if (ValidateValueProvided(category_id) == 0) {
+    UpdateHostOnError("A Product Category must be selected");
+  } else if ((valid_category_ids == NULL) || (array_length == 0)) {
+    UpdateHostOnError("There are no Product Categories available");
     return 0;
-  }
-
-  if ((valid_category_ids == NULL) || (array_length == 0)) {
-    UpdateHostAboutError("There are no Product Categories available");
+  } else if (IsCategoryIdInArray(category_id, valid_category_ids,
+                                 array_length) == 0) {
+    UpdateHostOnError("The selected Category is not valid");
     return 0;
-  }
-
-  if (IsCategoryIdInArray(category_id, valid_category_ids, array_length) == 0) {
-    UpdateHostAboutError("The selected Category is not valid");
-    return 0;
+  } else {
+    UpdateHostOnSuccess();
   }
 
   return 1;
