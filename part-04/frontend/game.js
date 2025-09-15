@@ -40,8 +40,9 @@ var Module = {
   },
 };
 
-function generateCards(rows, columns, level) {
-  document.getElementById("currentLevel").innerText = `Level ${level}`;
+function generateCards(rows, columns, level, tries) {
+  document.getElementById("currentLevel").innerText = level;
+  document.getElementById("tries").innerText = tries;
 
   let html = "";
   for (let row = 0; row < rows; row++) {
