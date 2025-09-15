@@ -22,6 +22,11 @@ fs.readFile("validate.wasm", function (error, bytes) {
 
 function instantiateWebAssembly(bytes) {
   const importObject = {
+    env: {
+      UpdateHostAboutError: (errorMessagePointer) => {
+        setErrorMessage(getStringFromMemory(errorMessagePointer));
+      },
+    },
     wasi_snapshot_preview1: {
       proc_exit: (value) => {},
     },
@@ -39,20 +44,10 @@ function setErrorMessage(error) {
 }
 
 function validateData() {
-  let errorMessage = "";
-  const errorMessagePointer = moduleExports.create_buffer(256);
-
   if (
-    !validateName(clientData.name, errorMessagePointer) ||
-    !validateCategory(clientData.categoryId, errorMessagePointer)
+    validateName(clientData.name) &&
+    validateCategory(clientData.categoryId)
   ) {
-    errorMessage = getStringFromMemory(errorMessagePointer);
-  }
-
-  moduleExports.free_buffer(errorMessagePointer);
-
-  setErrorMessage(errorMessage);
-  if (errorMessage === "") {
     // no issues, we can save to the database
   }
 }
@@ -81,22 +76,18 @@ function copyStringToMemory(value, memoryOffset) {
   bytes.set(new util.TextEncoder().encode(value + "\0"), memoryOffset);
 }
 
-function validateName(name, errorMessagePointer) {
+function validateName(name) {
   const namePointer = moduleExports.create_buffer(name.length + 1);
   copyStringToMemory(name, namePointer);
 
-  const isValid = moduleExports.ValidateName(
-    namePointer,
-    MAXIMUM_NAME_LENGTH,
-    errorMessagePointer
-  );
+  const isValid = moduleExports.ValidateName(namePointer, MAXIMUM_NAME_LENGTH);
 
   moduleExports.free_buffer(namePointer);
 
   return isValid === 1;
 }
 
-function validateCategory(categoryId, errorMessagePointer) {
+function validateCategory(categoryId) {
   const categoryIdPointer = moduleExports.create_buffer(categoryId.length + 1);
   copyStringToMemory(categoryId, categoryIdPointer);
 
@@ -112,8 +103,7 @@ function validateCategory(categoryId, errorMessagePointer) {
   const isValid = moduleExports.ValidateCategory(
     categoryIdPointer,
     arrayPointer,
-    arrayLength,
-    errorMessagePointer
+    arrayLength
   );
 
   moduleExports.free_buffer(arrayPointer);
