@@ -1,4 +1,4 @@
-# webassembly
+# 📓웹어셈블리 인 액션
 
 ```bash
 source emsdk_env.sh
