@@ -13,12 +13,19 @@ var Module = {
         const sideImportObject = {
           env: {
             memory: moduleMemory,
-            _malloc: typeof mainInstance.exports.malloc === "function" ? mainInstance.exports.malloc : () => {},
-            _free: typeof mainInstance.exports.free === "function" ? mainInstance.exports.free : () => {},
+            _malloc:
+              typeof mainInstance.exports.malloc === "function"
+                ? mainInstance.exports.malloc
+                : () => {},
+            _free:
+              typeof mainInstance.exports.free === "function"
+                ? mainInstance.exports.free
+                : () => {},
             _SeedRandomNumberGenerator:
               mainInstance.exports.SeedRandomNumberGenerator,
             _GetRandomNumber: mainInstance.exports.GetRandomNumber,
             _GenerateCards: generateCards,
+            _UpdateTriesTotal: updateTriesTotal,
             _FlipCard: flipCard,
             _RemoveCards: removeCards,
             _LevelComplete: levelComplete,
@@ -95,11 +102,12 @@ function removeCards(
   card.style.visibility = "hidden";
 }
 
-function levelComplete(level, hasAnotherLevel) {
+function levelComplete(level, tries, hasAnotherLevel) {
   document.getElementById("levelComplete").style.display = "";
+  document.getElementById("levelSummary").innerText = "Good job!";
   document.getElementById(
     "levelSummary"
-  ).innerText = `You've completed level ${level}!`;
+  ).innerText = `You've completed level ${level}  with ${tries}.`;
   if (!hasAnotherLevel) {
     document.getElementById("playNextLevel").style.display = "none";
   }
@@ -139,4 +147,8 @@ function replayLevel() {
 function playNextLevel() {
   document.getElementById("levelComplete").style.display = "none";
   moduleExports._PlayNextLevel();
+}
+
+function updateTriesTotal(tries) {
+  document.getElementById("tries").innerText = tries;
 }

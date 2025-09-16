@@ -307,11 +307,13 @@
             call $FlipCard
         end
         get_global $tries
-        i32.const 1
+        i32.const 10
         i32.add
         set_global $tries
+
         get_global $tries
         call $UpdateTriesTotal
+        
         call $ResetSelectedCardValues
         i32.const 0
         set_global $execution_paused
