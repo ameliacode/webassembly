@@ -1,4 +1,4 @@
-### 📓웹어셈블리 인 액션
+## 📓웹어셈블리 인 액션
 
 ```bash
 source emsdk_env.sh
