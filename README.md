@@ -1,5 +1,6 @@
 ## 📓웹어셈블리 인 액션
 
+## Setup
 ```bash
 source emsdk_env.sh
 
