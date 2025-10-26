@@ -1,11 +1,10 @@
-## 📓웹어셈블리 인 액션
+## 📓WebAssembly in Action
 
 ## Setup
 ```bash
 source emsdk_env.sh
 
-## RUN FILE
-# option 1
+# option 1: run file
 emrun [OBJECTIVE].html
 
 # option 2: run local server
@@ -14,4 +13,4 @@ python -m http.server
 
 ## Reference
 
-- [official repo](https://github.com/cggallant/WebAssembly-in-Action)
+- [Official Repository](https://github.com/cggallant/WebAssembly-in-Action)
